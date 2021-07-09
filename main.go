@@ -1,22 +1,28 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
+
+	"github.com/flily/netkitty/aio"
 )
 
 type ListenReader struct {
 	listener net.Listener
 	conn     net.Conn
+	signConn chan struct{}
 }
 
 func NewListenReader(listener net.Listener) *ListenReader {
 	return &ListenReader{
 		listener: listener,
+		signConn: make(chan struct{}),
 	}
 }
 
@@ -32,12 +38,20 @@ func (r *ListenReader) Read(buffer []byte) (int, error) {
 			return -1, err
 		}
 		r.conn = conn
+		r.signConn <- struct{}{}
 	}
 
 	return r.conn.Read(buffer)
 }
 
-func MakeListener(port int, useUDP bool) (io.ReadCloser, error) {
+func (r *ListenReader) Write(buffer []byte) (int, error) {
+	if r.conn == nil {
+		<-r.signConn
+	}
+	return r.conn.Write(buffer)
+}
+
+func MakeListener(port int, useUDP bool) (io.ReadWriteCloser, error) {
 	network := "tcp"
 	if useUDP {
 		network = "udp"
@@ -51,7 +65,7 @@ func MakeListener(port int, useUDP bool) (io.ReadCloser, error) {
 	return NewListenReader(listener), nil
 }
 
-func MakeSource(s string, useUDP bool) (io.ReadCloser, error) {
+func MakeSource(s string, useUDP bool) (io.ReadWriteCloser, error) {
 	network := "tcp"
 	if useUDP {
 		network = "udp"
@@ -76,7 +90,7 @@ func MakeSource(s string, useUDP bool) (io.ReadCloser, error) {
 	}
 }
 
-func MakeTarget(s string, useUDP bool) (io.WriteCloser, error) {
+func MakeTarget(s string, useUDP bool) (io.ReadWriteCloser, error) {
 	network := "tcp"
 	if useUDP {
 		network = "udp"
@@ -102,40 +116,78 @@ func MakeTarget(s string, useUDP bool) (io.WriteCloser, error) {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	listenPort := flag.Int("listen", 0, "listen port")
 	useUDP := flag.Bool("udp", false, "use UDP")
 	flag.Parse()
 
 	if *listenPort < 0 || *listenPort >= 65536 {
-		fmt.Printf("invalid port number %d", *listenPort)
+		log.Printf("invalid port number %d", *listenPort)
 		return
 	}
 
-	var source io.ReadCloser = os.Stdin
-	var target io.WriteCloser = os.Stdout
+	source := aio.NewSimpleDuplexer(aio.NewTerminal())
+	target := aio.NewSimpleDuplexer(aio.NewTerminal())
 
 	if *listenPort != 0 {
 		conn, err := MakeListener(*listenPort, *useUDP)
 		if err != nil {
-			fmt.Printf("listen error: %s", err)
+			log.Printf("listen error: %s", err)
 			return
 		}
-		source = conn
+		source = aio.NewSimpleDuplexer(conn)
 	}
 
 	if flag.NArg() > 0 {
 		endpointString := flag.Arg(0)
 		conn, err := MakeTarget(endpointString, *useUDP)
 		if err != nil {
-			fmt.Printf("dial error: %s", err)
+			log.Printf("dial error: %s", err)
 			return
 		}
-		target = conn
+		target = aio.NewSimpleDuplexer(conn)
 	}
 
 	defer source.Close()
 	defer target.Close()
 
-	tee := io.TeeReader(source, target)
-	io.ReadAll(tee)
+	source.Run()
+	target.Run()
+
+	rc, wc := false, false
+
+forloop:
+	for {
+		select {
+		case data := <-source.Recv():
+			if data.Err != nil {
+				if !errors.Is(data.Err, io.EOF) {
+					log.Printf("write error: %s", data.Err)
+					break forloop
+				}
+
+				wc = true
+				if rc && wc {
+					break forloop
+				}
+			}
+
+			target.Send() <- data.Data
+
+		case data := <-target.Recv():
+			if data.Err != nil {
+				if !errors.Is(data.Err, io.EOF) {
+					log.Printf("read error: %s", data.Err)
+					break forloop
+				}
+
+				rc = true
+				if rc && wc {
+					break forloop
+				}
+			}
+
+			source.Send() <- data.Data
+		}
+	}
 }
