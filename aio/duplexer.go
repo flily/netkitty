@@ -48,9 +48,10 @@ func (p *SimpleDuplexPipe) Recv() <-chan DuplexData {
 	return p.recvCh
 }
 
-func (p *SimpleDuplexPipe) Run() {
+func (p *SimpleDuplexPipe) Run() error {
 	go p.loopRecv()
 	go p.loopSend()
+	return nil
 }
 
 func (p *SimpleDuplexPipe) loopSend() {

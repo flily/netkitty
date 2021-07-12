@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,45 +10,8 @@ import (
 	"strings"
 
 	"github.com/flily/netkitty/aio"
+	"github.com/flily/netkitty/netio"
 )
-
-type ListenReader struct {
-	listener net.Listener
-	conn     net.Conn
-	signConn chan struct{}
-}
-
-func NewListenReader(listener net.Listener) *ListenReader {
-	return &ListenReader{
-		listener: listener,
-		signConn: make(chan struct{}),
-	}
-}
-
-func (r *ListenReader) Close() error {
-	r.conn.Close()
-	return r.listener.Close()
-}
-
-func (r *ListenReader) Read(buffer []byte) (int, error) {
-	if r.conn == nil {
-		conn, err := r.listener.Accept()
-		if err != nil {
-			return -1, err
-		}
-		r.conn = conn
-		r.signConn <- struct{}{}
-	}
-
-	return r.conn.Read(buffer)
-}
-
-func (r *ListenReader) Write(buffer []byte) (int, error) {
-	if r.conn == nil {
-		<-r.signConn
-	}
-	return r.conn.Write(buffer)
-}
 
 func MakeListener(port int, useUDP bool) (io.ReadWriteCloser, error) {
 	network := "tcp"
@@ -62,7 +24,7 @@ func MakeListener(port int, useUDP bool) (io.ReadWriteCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewListenReader(listener), nil
+	return netio.NewListenReader(listener), nil
 }
 
 func MakeSource(s string, useUDP bool) (io.ReadWriteCloser, error) {
@@ -77,7 +39,7 @@ func MakeSource(s string, useUDP bool) (io.ReadWriteCloser, error) {
 		if err != nil {
 			return nil, err
 		}
-		return NewListenReader(listener), nil
+		return netio.NewListenReader(listener), nil
 
 	} else {
 		// File
@@ -148,46 +110,11 @@ func main() {
 		target = aio.NewSimpleDuplexer(conn)
 	}
 
-	defer source.Close()
-	defer target.Close()
+	forwarder := aio.NewForwarder(source, target)
 
-	source.Run()
-	target.Run()
-
-	rc, wc := false, false
-
-forloop:
-	for {
-		select {
-		case data := <-source.Recv():
-			if data.Err != nil {
-				if !errors.Is(data.Err, io.EOF) {
-					log.Printf("write error: %s", data.Err)
-					break forloop
-				}
-
-				wc = true
-				if rc && wc {
-					break forloop
-				}
-			}
-
-			target.Send() <- data.Data
-
-		case data := <-target.Recv():
-			if data.Err != nil {
-				if !errors.Is(data.Err, io.EOF) {
-					log.Printf("read error: %s", data.Err)
-					break forloop
-				}
-
-				rc = true
-				if rc && wc {
-					break forloop
-				}
-			}
-
-			source.Send() <- data.Data
-		}
+	defer forwarder.Close()
+	err := forwarder.Forward()
+	if err != nil {
+		log.Printf("io error: %s", err)
 	}
 }
